@@ -6,12 +6,15 @@ from aiohttp.client_exceptions import ClientConnectorError
 import json
 import base64
 import time
+import hashlib
+from getmac import get_mac_address as gma
+
 
 # Define Node Class From Specification
 class Node:
-    def __init__(self, name, id, exposed, address, public_key):
+    def __init__(self, name, exposed, address, public_key):
         self.peer_name = name
-        self.unique_id = id
+        self.unique_id = self.generate_unique_id()
         self.exposed = exposed
         self.address = address
         self.created = time.time()
@@ -19,11 +22,15 @@ class Node:
         self.ttl = float('inf')
         self.peers = {}  # stores the nodes this node can directly contact
         self.offers = {}  # stores the ConnectOffers by source_id
-        self.bootstrap_nodes = ["http://peer1_address", "http://peer2_address"]  # predefined list of bootstrap nodes 
-    
-    # function to set time to live 
-    def set_ttl(self, ttl):
-        self.ttl = ttl
+        self.bootstrap_nodes = ["http://peer1_address", "http://peer2_address"]  # predefined list of bootstrap nodes
+
+
+    def generate_unique_id(self):
+        mac_address = gma()
+        node_name = self.peer_name
+        identity_string = f"{mac_address}|{node_name}"
+        hashed_identity_string = hashlib.sha256(identity_string.encode('utf-8')).hexdigest()
+        return hashed_identity_string
 
     # function to register new peer
     def register_peer(self, data):
@@ -36,40 +43,46 @@ class Node:
     def get_peers_data(self):
         return list(map(lambda x: x.__dict__, self.peers.values()))
     
-    # function to handle a content packet 
+    # Update to handle_packet function to add TTL checking
     def handle_packet(self, packet):
         packet_obj = ContentPacket(packet['source_id'], packet['destination_id'], packet['protocol'], packet['payload'])
-        # decrease TTL to prevent infinite propagation 
-        packet_obj.decrease_ttl()
+        # check if packet TTL has expired
+        if packet_obj.ttl <= 0:
+            print("Packet TTL has expired. Skipping...")
+            return
         # check if this node is the destination 
         if packet_obj.destination_id == self.unique_id:
             self.receive_content(packet_obj)
         else:
-            # if not, forward to all peers
+            packet_obj.decrease_ttl()
             asyncio.create_task(self.forward_packet(packet_obj))
+            asyncio.create_task(self.forward_packet(packet_obj))
+
+        
+    # Update to handle_offer function to add TTL checking
+    def handle_offer(self, offer):
+        co = ConnectOffer(offer['source_id'], offer['destination_id'], offer['turn_server'], offer['sdp_offer'])
+        # check if offer TTL has expired 
+        if co.ttl <= 0:
+            print("Offer TTL has expired. Skipping...")
+            return
+        self.offers[co.source_id] = co
+        asyncio.create_task(self.forward_offer(co))
+
+    # Update to handle_connect function to add TTL checking
+    def handle_connect(self, response):
+        cr = ConnectResponse(response['source_id'], response['destination_id'], response['turn_server'], response['sdp_answer'])
+        # check if response TTL has expired
+        if cr.ttl <= 0:
+            print("Connect response TTL has expired. Skipping...")
+            return
+        asyncio.create_task(self.forward_connect(cr))
     
     # logic to forward a packet to all peers
     async def forward_packet(self, packet_obj):
         for peer in self.peers.values():
             session = aiohttp.ClientSession()
             await session.post(f'{peer.address}/api/v1/packet_send', json=packet_obj.__dict__)
-
-    # function to handle offers 
-    def handle_offer(self, offer):
-        co = ConnectOffer(offer['source_id'], offer['destination_id'], offer['turn_server'], offer['sdp_offer'])
-        co.ttl -= 1
-        if co.ttl <= 0 or co.destination_id == self.unique_id:
-            return
-        self.offers[co.source_id] = co
-        asyncio.create_task(self.forward_offer(co))
-
-    # function to handle connect response 
-    def handle_connect(self, response):
-        cr = ConnectResponse(response['source_id'], response['destination_id'], response['turn_server'], response['sdp_answer'])
-        cr.ttl -= 1
-        if cr.ttl <= 0 or cr.destination_id == self.unique_id:
-            return
-        asyncio.create_task(self.forward_connect(cr))
 
     # function to forward an offer 
     async def forward_offer(self, co):
